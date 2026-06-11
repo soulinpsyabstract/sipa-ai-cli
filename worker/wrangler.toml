@@ -1,0 +1,10 @@
+name = "sipa-ai-cli"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+routes = [
+  { pattern = "sipa-ai.sipa-os.org/*", zone_name = "sipa-os.org" }
+]
+
+[vars]
+SIPA_AI_BACKEND = "https://sipa-ai-backend.soulinpsy.info"

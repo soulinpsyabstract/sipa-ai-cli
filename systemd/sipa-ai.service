@@ -1,0 +1,18 @@
+[Unit]
+Description=SIPA AI CLI API · MLL L01-L10 · Port 5003
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=sipa
+WorkingDirectory=/home/sipa/apps/sipa-ai-cli
+EnvironmentFile=-/home/sipa/.sipa_env
+ExecStart=/usr/bin/python3 -m uvicorn api:app --host 127.0.0.1 --port 5003 --log-level info
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
