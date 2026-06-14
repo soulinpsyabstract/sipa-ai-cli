@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-# SIPA AI CLI · V1.0 · SIPA OS · MLL L01-L10
-# Usage: sipa-ai                          → REPL (interactive)
-#        sipa-ai "вопрос"                 → быстрый вызов
-#        sipa-ai --model claude "вопрос"  → конкретная модель
-#        sipa-ai --layer L05 "вопрос"     → конкретный слой MLL
-#        sipa-ai --status                 → статус системы
+# SIPA AI CLI · V1.1 · SIPA OS · MLL L01-L10 · Guardian audit
+# Usage: sipa-ai → REPL (только интерактивный режим)
 #
-# Архитектура: USER → GUARD(Protocol 0) → L01 classify → L02 route → Lxx ask.sh → ответ
+# Внутри сессии:
+#   /models          — список слоёв MLL
+#   /status          — статус системы
+#   /layer L05       — принудительный слой
+#   /model deepseek  — принудительная модель
+#   /history         — история сессии
+#   /clear           — очистить историю
+#   /exit            — выход
+#
+# Архитектура: USER → GUARD(Protocol 0) → MLL auto-route → ask.sh → Guardian audit
 
-import sys, os, subprocess, json, re, time
+import sys, os, subprocess, json, re, time, hashlib
 from datetime import datetime
 from pathlib import Path
 
@@ -23,6 +28,7 @@ ASK_SH       = Path("/home/sipa/PROJECT/PAYTON_HUBS/BIN/ask.sh")
 SESSIONS_DIR = Path("/home/sipa/bin/sessions/cli")
 SIPA_ENV     = Path("/home/sipa/.sipa_env")
 COST_LOG     = Path("/home/sipa/PROJECT/PAYTON_HUBS/HUB_WORKING_FILES/OR_COST_JOURNAL.tsv")
+AUDIT_LOG    = Path("/home/sipa/PROJECT/PAYTON_HUBS/HUB_LEGAL_FORENSIC/AUDIT__LEGAL_FIXATIONS.log")
 
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -47,8 +53,8 @@ if not sys.stdout.isatty():
 LOGO = f"""\
 {CYAN}{BOLD}
  ╔══════════════════════════════════════════╗
- ║  S I P A   A I   C L I  ·  V1.0         ║
- ║  MLL L01–L10 · Protocol 0 · ask.sh      ║
+ ║  S I P A   A I   C L I  ·  V1.1         ║
+ ║  MLL L01–L10 · Protocol 0 · Guardian    ║
  ╚══════════════════════════════════════════╝{R}"""
 
 HELP_TEXT = f"""\
@@ -70,7 +76,7 @@ LAYER_MAP = {
     "L03": ("deepseek",      "Research · знания / ответ"),
     "L04": ("gemini",        "Vision · мультимодал / аудио"),
     "L05": ("qwen2.5-coder", "Executor · код / сборка"),
-    "L06": ("nim-llama33",   "Audit · верификация"),
+    "L06": ("deepseek",      "Audit · верификация"),
     "L07": ("deepseek",      "Memory · история / контекст"),
     "L08": ("claude-s",      "Writer · текст / посты"),
     "L09": ("groq",          "Aggregator · суммаризация"),
@@ -89,7 +95,7 @@ ROUTE_RULES = [
      "L08"),
     (r"\b(помни|запомни|история|history|прошлое|session|контекст|вспомни)\b",
      "L07"),
-    (r"\b(статус|status|health|работает|сломан|ошибка|error|диагностика|сервис)\b",
+    (r"\b(статус\s+сервис|service\s+status|health\s+check|сломан|диагностика|проверь\s+сервис|audit|верифицируй)\b",
      "L06"),
     (r"\b(итого|суммируй|summary|резюме|кратко|сжато|tl;dr)\b",
      "L09"),
@@ -109,6 +115,22 @@ CRISIS_PATTERNS = [
     r"\b(суицид|самоубийство|хочу\s+умереть|убить\s+себя|не\s+хочу\s+жить|покончить\s+с\s+собой)\b",
     r"\b(i\s+want\s+to\s+die|kill\s+myself|end\s+my\s+life|suicid)\b",
 ]
+
+def _phash(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()[:12]
+
+def guardian_audit(tag: str, layer: str = "", model: str = "", phash: str = "", elapsed: float = 0.0):
+    ts = datetime.now().strftime("%Y-%m-%d__%H-%M-%S")
+    line = (
+        f"[{ts}] [SIPA_AI_CLI] [{tag}] "
+        f"layer={layer or '-'} model={model or '-'} elapsed={elapsed:.1f}s "
+        f"| prompt_hash={phash}\n"
+    )
+    try:
+        with AUDIT_LOG.open("a") as f:
+            f.write(line)
+    except Exception:
+        pass
 
 def guard(text: str) -> tuple[bool, str]:
     """Returns (pass, tag). False = blocked by Protocol 0."""
@@ -254,7 +276,9 @@ def process(
 ) -> str:
     # 1. GUARD — Protocol 0
     ok, tag = guard(text)
+    phash = _phash(text)
     if not ok:
+        guardian_audit("BLOCKED", phash=phash)
         return f"{RED}GUARD · Protocol 0 · заблокировано — попытка инъекции/переопределения{R}"
 
     # 2. Crisis Rail → L10 Failover
@@ -301,6 +325,9 @@ def process(
     # 7. Save to session
     session.push("user",      text,     model, layer)
     session.push("assistant", response, model, layer)
+
+    # 8. Guardian audit trail
+    guardian_audit(tag, layer=layer, model=model, phash=phash, elapsed=elapsed)
 
     return response
 
@@ -403,40 +430,7 @@ def repl():
 
 # ── CLI entry ─────────────────────────────────────────────────────────────────────
 def main():
-    args = sys.argv[1:]
-
-    if not args:
-        repl()
-        return
-
-    # Parse flags
-    forced_model = None
-    forced_layer = None
-    query_parts  = []
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a in ("--model", "-m") and i + 1 < len(args):
-            forced_model = args[i + 1]; i += 2
-        elif a in ("--layer", "-l") and i + 1 < len(args):
-            forced_layer = args[i + 1]; i += 2
-        elif a == "--status":
-            print_status(); return
-        elif a == "--models":
-            print_models(); return
-        elif a == "--help":
-            print(LOGO); print(HELP_TEXT); return
-        else:
-            query_parts.append(a); i += 1
-
-    if not query_parts:
-        repl()
-        return
-
-    query = " ".join(query_parts)
-    session = Session()
-    response = process(query, session, forced_layer, forced_model, silent=False)
-    print(response)
+    repl()
 
 if __name__ == "__main__":
     main()

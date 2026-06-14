@@ -1,6 +1,6 @@
-// SIPA AI CLI · Cloudflare Worker · V1.0
+// SIPA AI CLI · Cloudflare Worker · V1.1
 // Domain: sipa-ai.sipa-os.org
-// Routes: /ask · /health · /models · /mcp
+// Routes: /ask · /health · /models · /mcp · /session/* · /webhook
 // Backend: sipa-ai API on SERVER (via CF Tunnel or direct)
 
 const BACKEND = "http://127.0.0.1:5003"; // overridden by SIPA_AI_BACKEND env var

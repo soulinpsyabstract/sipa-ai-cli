@@ -1,0 +1,92 @@
+version: "3.9"
+
+# SIPA AI CLI · docker-compose · V1.0
+# Services: api (FastAPI port 5003) + cloudflared tunnel
+# ask.sh монтируется с хоста как read-only bind mount
+# Сессии и аудит-лог — именованные volumes (persist между рестартами)
+
+services:
+
+  # ── SIPA AI API ──────────────────────────────────────────────────────────────
+  sipa-ai-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sipa-ai-api
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:5003:5003"   # доступен только с хоста, не наружу
+
+    environment:
+      # ── Пути внутри контейнера (должны совпадать с api.py) ──
+      # ASK_SH читается как /home/sipa/PROJECT/PAYTON_HUBS/BIN/ask.sh
+      # — монтируется ниже как bind mount
+
+      # ── API ключи из .sipa_env (передаём явно нужные) ──────
+      DEEPSEEK_API_KEY:      ${DEEPSEEK_API_KEY}
+      ANTHROPIC_API_KEY:     ${ANTHROPIC_API_KEY}
+      OPENAI_API_KEY:        ${OPENAI_API_KEY}
+      GEMINI_API_KEY:        ${GEMINI_API_KEY}
+      GROQ_API_KEY:          ${GROQ_API_KEY:-}
+      TOGETHER_API_KEY:      ${TOGETHER_API_KEY:-}
+      NEBIUS_API_KEY:        ${NEBIUS_API_KEY:-}
+      SIPA_WEBHOOK_SECRET:   ${SIPA_WEBHOOK_SECRET:-}
+
+      # ── Runtime ──────────────────────────────────────────────
+      TERM: xterm
+      PYTHONUNBUFFERED: "1"
+
+    volumes:
+      # ask.sh — read-only, берётся прямо с хоста
+      - /home/sipa/PROJECT/PAYTON_HUBS/BIN/ask.sh:/home/sipa/PROJECT/PAYTON_HUBS/BIN/ask.sh:ro
+
+      # Сессии — persist volume
+      - sipa-sessions:/home/sipa/bin/sessions/cli
+
+      # Аудит-лог — bind к реальному файлу на хосте
+      - /home/sipa/PROJECT/PAYTON_HUBS/HUB_LEGAL_FORENSIC:/home/sipa/PROJECT/PAYTON_HUBS/HUB_LEGAL_FORENSIC
+
+      # .sipa_env — read-only, нужен для _webhook_secret()
+      - /home/sipa/.sipa_env:/home/sipa/.sipa_env:ro
+
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:5003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Cloudflared tunnel ───────────────────────────────────────────────────────
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: sipa-ai-tunnel
+    restart: unless-stopped
+    depends_on:
+      sipa-ai-api:
+        condition: service_healthy
+
+    command: tunnel --no-autoupdate run --token ${SIPA_MAIN_TUNNEL_TOKEN}
+
+    environment:
+      SIPA_MAIN_TUNNEL_TOKEN: ${SIPA_MAIN_TUNNEL_TOKEN}
+
+    # Cloudflared проксирует на api контейнер по имени сервиса
+    # Настрой в CF dashboard: tunnel → ingress → http://sipa-ai-api:5003
+    # (или передай через --url если используешь quick tunnel)
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+volumes:
+  sipa-sessions:
+    driver: local

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-# SIPA AI CLI · HTTP API · V1.0
-# FastAPI → ask.sh backend · MLL L01-L10 · Protocol 0 GUARD
-# Port: 5003 · Endpoint: /ask /health /models /session
+# SIPA AI CLI · HTTP API · V1.1
+# FastAPI → ask.sh backend · MLL L01-L10 · Protocol 0 GUARD · Guardian audit · Webhook
+# Port: 5003 · Endpoints: /ask /health /models /session /mcp /webhook
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request as FastRequest
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
-import subprocess, json, re, time, os, sys
+import subprocess, json, re, time, os, sys, hashlib
 from datetime import datetime
 from pathlib import Path
 
@@ -15,14 +15,31 @@ from pathlib import Path
 ASK_SH       = Path("/home/sipa/PROJECT/PAYTON_HUBS/BIN/ask.sh")
 SESSIONS_DIR = Path("/home/sipa/bin/sessions/cli")
 SIPA_ENV     = Path("/home/sipa/.sipa_env")
+AUDIT_LOG    = Path("/home/sipa/PROJECT/PAYTON_HUBS/HUB_LEGAL_FORENSIC/AUDIT__LEGAL_FIXATIONS.log")
 
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(
     title="SIPA AI CLI API",
-    description="MLL L01–L10 gateway · Protocol 0 guard · ask.sh backend",
-    version="1.0.0",
+    description="MLL L01–L10 gateway · Protocol 0 guard · ask.sh backend · Guardian audit",
+    version="1.1.0",
 )
+
+def _phash(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()[:12]
+
+def guardian_audit(tag: str, layer: str = "", model: str = "", phash: str = "", elapsed: float = 0.0, source: str = "api"):
+    ts = datetime.now().strftime("%Y-%m-%d__%H-%M-%S")
+    line = (
+        f"[{ts}] [SIPA_AI_API] [{tag}] source={source} "
+        f"layer={layer or '-'} model={model or '-'} elapsed={elapsed:.1f}s "
+        f"| prompt_hash={phash}\n"
+    )
+    try:
+        with AUDIT_LOG.open("a") as f:
+            f.write(line)
+    except Exception:
+        pass
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,23 +52,25 @@ app.add_middleware(
 LAYER_MAP = {
     "L01": ("deepseek",      "IntakeRouter"),
     "L02": ("deepseek",      "Orchestrator"),
-    "L03": ("deepseek",      "Research"),
+    "L03": ("chat",           "Research"),       # DeepSeek Chat direct · 2-4s
     "L04": ("gemini",        "Vision"),
-    "L05": ("qwen2.5-coder", "Executor"),
-    "L06": ("nim-llama33",   "Audit"),
-    "L07": ("deepseek",      "Memory"),
+    "L05": ("codestral",     "Executor"),        # Mistral Codestral FREE
+    "L06": ("deepseek",      "Audit"),
+    "L07": ("tg-llama4",     "Memory"),          # Together Llama4 · CF bypass
     "L08": ("claude-s",      "Writer"),
     "L09": ("groq",          "Aggregator"),
     "L10": ("claude",        "Failover"),
+    "L11": ("nemoguard",     "Safety"),          # NVIDIA NIM safety guard
 }
 
 ROUTE_RULES = [
+    (r"\b(unsafe|jailbreak|harm|опасно|взлом|bomb|weapon)\b",                   "L11"),
     (r"\b(код|code|debug|fix|баг|функция|скрипт|python|bash|js|typescript)\b", "L05"),
     (r"\b(нарисуй|картинку|image|изображение|видео|video|аудио|audio)\b",      "L04"),
     (r"\b(найди|search|поищи|research|статья|paper|источник|web)\b",            "L03"),
     (r"\b(напиши|write|пост|письмо|article|caption|linkedin|текст)\b",          "L08"),
     (r"\b(помни|запомни|история|history|прошлое|session|вспомни)\b",            "L07"),
-    (r"\b(статус|status|health|работает|сломан|ошибка|error)\b",                "L06"),
+    (r"\b(статус\s+сервис|service\s+status|health\s+check|сломан|диагностика|audit|верифицируй)\b", "L06"),
     (r"\b(итого|суммируй|summary|резюме|кратко|tl;dr)\b",                       "L09"),
 ]
 
@@ -147,7 +166,7 @@ def health():
     return {
         "status": "ok",
         "service": "sipa-ai-cli",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "ask_sh": ASK_SH.exists(),
         "ts": datetime.utcnow().isoformat() + "Z"
     }
@@ -165,7 +184,9 @@ def models():
 def ask(req: AskRequest):
     # 1. GUARD
     ok, tag = guard_check(req.text)
+    phash = _phash(req.text)
     if not ok:
+        guardian_audit("BLOCKED", phash=phash, source="ask")
         raise HTTPException(status_code=403, detail="Protocol 0 guard rejected input")
 
     crisis = (tag == "CRISIS")
@@ -204,6 +225,8 @@ def ask(req: AskRequest):
     if len(history) > 30:
         history = history[-30:]
     save_session(sid, history)
+
+    guardian_audit(tag, layer=layer, model=model, phash=phash, elapsed=elapsed, source="ask")
 
     return AskResponse(
         response=response,
@@ -293,6 +316,88 @@ async def mcp_rpc(request: FastRequest):
             }}
 
     return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "method not found"}}
+
+# ── Webhook endpoint ────────────────────────────────────────────────────────────
+class WebhookRequest(BaseModel):
+    message: str
+    source: Optional[str] = "webhook"
+    session_id: Optional[str] = None
+    layer: Optional[str] = None
+    model: Optional[str] = None
+    secret: Optional[str] = None
+
+class WebhookResponse(BaseModel):
+    response: str
+    layer: str
+    model: str
+    elapsed: float
+    session_id: str
+    source: str
+    guard: str
+
+def _webhook_secret() -> str:
+    try:
+        line = next(
+            (l for l in SIPA_ENV.read_text().splitlines()
+             if l.startswith("SIPA_WEBHOOK_SECRET=")), ""
+        )
+        return line.split("=", 1)[1].strip().strip('"') if line else ""
+    except Exception:
+        return ""
+
+@app.post("/webhook", response_model=WebhookResponse)
+def webhook(req: WebhookRequest):
+    # Optional secret check
+    expected = _webhook_secret()
+    if expected and req.secret != expected:
+        guardian_audit("BLOCKED", phash=_phash(req.message), source=req.source or "webhook")
+        raise HTTPException(status_code=401, detail="invalid webhook secret")
+
+    # GUARD
+    ok, tag = guard_check(req.message)
+    phash = _phash(req.message)
+    if not ok:
+        guardian_audit("BLOCKED", phash=phash, source=req.source or "webhook")
+        raise HTTPException(status_code=403, detail="Protocol 0 guard rejected input")
+
+    crisis = (tag == "CRISIS")
+    layer, model, desc = auto_route(req.message, req.layer)
+    if req.model:
+        model = req.model
+    if crisis:
+        layer, model = "L10", "claude"
+
+    sid = req.session_id or datetime.now().strftime("wh_%Y%m%d_%H%M%S")
+    history = load_session(sid)
+    ctx_parts = [
+        f"{'User' if m['role']=='user' else 'Assistant'}: {m['text'][:200]}"
+        for m in history[-4:]
+    ]
+    ctx_str = " | ".join(ctx_parts)
+
+    if crisis:
+        prompt = f"[SIPA OS | CRISIS RAIL | L10] Пользователь в кризисе — отвечай с теплотой. Сообщение: {req.message}"
+    else:
+        header = f"[SIPA OS | {layer} | {desc} | src:{req.source}]"
+        prompt = f"{header} | {ctx_str} | {req.message}" if ctx_str else f"{header} | {req.message}"
+
+    t0 = time.time()
+    response = run_ask(model, prompt)
+    elapsed = round(time.time() - t0, 2)
+
+    history.append({"role": "user",      "text": req.message, "model": model, "layer": layer, "ts": datetime.utcnow().isoformat()})
+    history.append({"role": "assistant", "text": response,     "model": model, "layer": layer, "ts": datetime.utcnow().isoformat()})
+    if len(history) > 20:
+        history = history[-20:]
+    save_session(sid, history)
+
+    guardian_audit(tag, layer=layer, model=model, phash=phash, elapsed=elapsed, source=req.source or "webhook")
+
+    return WebhookResponse(
+        response=response, layer=layer, model=model,
+        elapsed=elapsed, session_id=sid,
+        source=req.source or "webhook", guard=tag,
+    )
 
 if __name__ == "__main__":
     import uvicorn
