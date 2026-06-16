@@ -13,7 +13,8 @@
 #
 # Архитектура: USER → GUARD(Protocol 0) → MLL auto-route → ask.sh → Guardian audit
 
-import sys, os, subprocess, json, re, time, hashlib
+import sys, os, subprocess, json, re, time, hashlib, threading
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -22,6 +23,110 @@ try:
     HAS_READLINE = True
 except ImportError:
     HAS_READLINE = False
+
+# ── TTS config ──────────────────────────────────────────────────────────────────
+_TTS_ENABLED   = False
+_ELEVEN_KEY    = os.environ.get("ELEVENLABS_API_KEY", "")
+_ELEVEN_VOICE  = os.environ.get("ELEVENLABS_VOICE_AELIN", "EXAVITQu4vr4xnSDxMaL")
+_ELEVEN_URL    = f"https://api.elevenlabs.io/v1/text-to-speech/{_ELEVEN_VOICE}/stream"
+
+def _strip_md(text: str) -> str:
+    t = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+    t = re.sub(r"`[^`]*`", "", t)
+    t = re.sub(r"[#*_\[\]|]", "", t)
+    t = re.sub(r"\n{2,}", " ", t)
+    return t.strip()[:600]
+
+def record_voice(seconds: int = 8) -> str:
+    """Record audio and transcribe via Whisper. Returns transcript or ''."""
+    import tempfile
+    wav = tempfile.mktemp(suffix=".wav")
+    device = os.environ.get("SIPA_DEVICE", "SERVER").upper()
+    openai_key = os.environ.get("OPENAI_API_KEY", "")
+    if not openai_key:
+        print(f"{RED}  OPENAI_API_KEY не найден — Whisper недоступен{R}")
+        return ""
+    # Record
+    print(f"{CYAN}  🎙  Запись {seconds}с ... (говори сейчас){R}", flush=True)
+    try:
+        if device in ("15T", "X7"):
+            subprocess.run(
+                ["termux-microphone-record", "-l", str(seconds), "-f", wav],
+                timeout=seconds + 5, check=True, capture_output=True
+            )
+        else:
+            subprocess.run(
+                ["arecord", "-d", str(seconds), "-f", "cd", "-q", wav],
+                timeout=seconds + 5, check=True, capture_output=True
+            )
+    except FileNotFoundError:
+        print(f"{RED}  Микрофон недоступен на этом устройстве{R}")
+        return ""
+    except Exception as e:
+        print(f"{RED}  Ошибка записи: {e}{R}")
+        return ""
+    # Transcribe via Whisper
+    print(f"{DIM}  Транскрипция ...{R}", flush=True)
+    try:
+        import mimetypes
+        boundary = "sipaboundary1234"
+        with open(wav, "rb") as f:
+            audio_data = f.read()
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="model"\r\n\r\nwhisper-1\r\n'
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="voice.wav"\r\n'
+            f"Content-Type: audio/wav\r\n\r\n"
+        ).encode() + audio_data + f"\r\n--{boundary}--\r\n".encode()
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/audio/transcriptions",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {openai_key}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            }
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read())
+            text = result.get("text", "").strip()
+            return text
+    except Exception as e:
+        print(f"{RED}  Whisper error: {e}{R}")
+        return ""
+    finally:
+        try:
+            os.unlink(wav)
+        except Exception:
+            pass
+
+def speak(text: str):
+    if not _TTS_ENABLED or not _ELEVEN_KEY:
+        return
+    def _play():
+        clean = _strip_md(text)
+        if not clean:
+            return
+        body = json.dumps({
+            "text": clean,
+            "model_id": "eleven_multilingual_v2",
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.78}
+        }).encode()
+        req = urllib.request.Request(
+            _ELEVEN_URL, data=body,
+            headers={"xi-api-key": _ELEVEN_KEY, "Content-Type": "application/json"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                audio = resp.read()
+            proc = subprocess.Popen(
+                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-"],
+                stdin=subprocess.PIPE
+            )
+            proc.communicate(audio)
+        except Exception:
+            pass
+    threading.Thread(target=_play, daemon=True).start()
 
 # ── Paths ───────────────────────────────────────────────────────────────────────
 ASK_SH       = Path("/home/sipa/PROJECT/PAYTON_HUBS/BIN/ask.sh")
@@ -65,6 +170,8 @@ HELP_TEXT = f"""\
   /model <alias>   — принудительная модель (авто = без аргумента)
   /history         — история сессии
   /clear           — очистить историю
+  /rec [сек]       — голосовой ввод (Whisper · по умолч. 8с)
+  /voice           — вкл/выкл TTS ответ (ElevenLabs)
   /help            — эта справка
   /exit            — выход{R}"""
 
@@ -405,6 +512,28 @@ def repl():
                     else:
                         forced_model = None
                         print(f"{DIM}  Модель сброшена → авто{R}")
+                elif cmd == "/rec":
+                    secs = int(arg) if arg.isdigit() else 8
+                    transcript = record_voice(secs)
+                    if transcript:
+                        print(f"{CYAN}  🎙 → {transcript}{R}")
+                        response = process(transcript, session, forced_layer, forced_model)
+                        if response:
+                            print(f"\n{GREEN}{BOLD}SIPA{R}: {response}\n")
+                            speak(response)
+                    else:
+                        print(f"{DIM}  (пусто — попробуй ещё раз){R}")
+                elif cmd == "/voice":
+                    global _TTS_ENABLED
+                    _TTS_ENABLED = not _TTS_ENABLED
+                    if _TTS_ENABLED:
+                        if _ELEVEN_KEY:
+                            print(f"{GREEN}  🔊 TTS ВКЛ · ElevenLabs · Aelin voice{R}")
+                        else:
+                            _TTS_ENABLED = False
+                            print(f"{RED}  ELEVENLABS_API_KEY не найден в .sipa_env{R}")
+                    else:
+                        print(f"{DIM}  🔇 TTS ВЫКЛ{R}")
                 elif cmd == "/session":
                     if arg:
                         session = Session(arg)
@@ -418,6 +547,7 @@ def repl():
             # ── AI query ──
             response = process(text, session, forced_layer, forced_model)
             print(f"\n{GREEN}{BOLD}SIPA{R}: {response}\n")
+            speak(response)
 
     except KeyboardInterrupt:
         print(f"\n{DIM}Прервано · Ctrl+C{R}")

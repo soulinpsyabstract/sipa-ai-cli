@@ -7,4 +7,4 @@ routes = [
 ]
 
 [vars]
-SIPA_AI_BACKEND = "https://sipa-ai-backend.soulinpsy.info"
+SIPA_AI_BACKEND = "https://sipa-ai-api.soulinpsy.info"
